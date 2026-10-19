@@ -1,0 +1,163 @@
+name: 通知企业微信
+
+# 监听的事件类型，按需增删
+# 注意：本仓库 Issues 当前未启用（hasIssuesEnabled=false），
+# 因此 issues 触发器不会生效；如需启用请在 Settings → General → Features 打开 Issues。
+on:
+  pull_request:
+    types: [opened, closed, reopened, synchronize, review_requested, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+  release:
+    types: [published, created, edited, deleted]
+  workflow_run:
+    types: [completed]
+  # push 触发频率很高，已限定为主分支；如不需要可整块注释掉
+  push:
+    branches: [main]
+
+concurrency:
+  group: wecom-notify-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.release.id || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+
+    steps:
+      - name: 组装消息
+        id: msg
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          TITLE: ${{ github.event.pull_request.title || github.event.issue.title || github.event.release.name || github.event.workflow_run.name || github.event.head_commit.message }}
+          NUM: ${{ github.event.pull_request.number || github.event.issue.number }}
+          URL: ${{ github.event.pull_request.html_url || github.event.issue.html_url || github.event.release.html_url || github.event.workflow_run.html_url }}
+          ACTION: ${{ github.event.action }}
+          REF_NAME: ${{ github.event.pull_request.head.ref }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          STATE: ${{ github.event.pull_request_review.state || github.event.review.state }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+        run: |
+          set -euo pipefail
+
+          # 去掉换行与多余空格，避免破坏 markdown 结构
+          SAFE_TITLE=$(echo "$TITLE" | tr '\n\r' '  ' | sed 's/[[:space:]]\+/ /g' | cut -c1-120)
+
+          # 评论正文单独截断（企业微信正文上限 4096 字节）
+          SNIP=$(echo "$COMMENT_BODY" | tr '\n\r' '  ' | sed 's/[[:space:]]\+/ /g' | cut -c1-150)
+
+          case "$EVENT_NAME" in
+            issues)
+              EMOJI="📌"
+              HEAD="Issue #${NUM} ${SAFE_TITLE}"
+              ;;
+            pull_request)
+              EMOJI="🔀"
+              HEAD="PR #${NUM} ${SAFE_TITLE}"
+              ;;
+            pull_request_review)
+              EMOJI="⭐️"
+              HEAD="PR #${NUM} 评审：${STATE} — ${SAFE_TITLE}"
+              ;;
+            issue_comment)
+              EMOJI="💬"
+              HEAD="#${NUM} 新评论"
+              ;;
+            release)
+              EMOJI="🚀"
+              HEAD="Release ${SAFE_TITLE}"
+              ;;
+            workflow_run)
+              if [ "$WR_CONCLUSION" != "failure" ]; then
+                echo "conclusion=$WR_CONCLUSION 非失败，跳过通知"
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              EMOJI="❌"
+              HEAD="CI 失败：${SAFE_TITLE}"
+              ;;
+            push)
+              EMOJI="📥"
+              HEAD="推送至 ${BRANCH}：${SAFE_TITLE}"
+              ;;
+            *)
+              EMOJI="🔔"
+              HEAD="${SAFE_TITLE}"
+              ;;
+          esac
+
+          {
+            echo "**${EMOJI} ${HEAD}**"
+            echo "> 仓库：\`${REPO}\`"
+            echo "> 操作者：${ACTOR}　事件：\`${ACTION}\`"
+            if [ -n "${REF_NAME:-}" ]; then
+              echo "> 来源分支：\`${REF_NAME}\`"
+            fi
+            if [ -n "$SNIP" ]; then
+              echo ""
+              echo "> 评论：${SNIP}"
+            fi
+            if [ -n "${URL:-}" ]; then
+              echo ""
+              echo "[查看详情](${URL})"
+            fi
+          } > body.md
+
+          echo "content<<EOF_WECOM" >> "$GITHUB_OUTPUT"
+          cat body.md
+          echo "" >> "$GITHUB_OUTPUT"
+          echo "EOF_WECOM" >> "$GITHUB_OUTPUT"
+
+      - name: 推送到企业微信
+        if: steps.msg.outputs.skip != 'true'
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK_URL }}
+          CONTENT: ${{ steps.msg.outputs.content }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${WECOM_WEBHOOK:-}" ]; then
+            echo "::warning::未配置 secret WECOM_WEBHOOK_URL，跳过推送"
+            exit 0
+          fi
+
+          # 企业微信 markdown 内容上限 4096 字节，留出余量后截断
+          MAX=3800
+          if [ "${#CONTENT}" -gt "$MAX" ]; then
+            CONTENT="${CONTENT:0:$MAX}..."
+          fi
+
+          export CONTENT
+          PAYLOAD=$(jq -n '{msgtype:"markdown", markdown:{content: env.CONTENT}}')
+
+          RESP=$(curl -s -w "\n%{http_code}" -X POST "$WECOM_WEBHOOK" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD")
+
+          CODE=$(echo "$RESP" | tail -n1)
+          BODY=$(echo "$RESP" | sed '$d')
+
+          echo "HTTP $CODE: $BODY"
+
+          if [ "$CODE" != "200" ]; then
+            echo "::error::企业微信返回非 200，$BODY"
+            exit 1
+          fi
+
+          ERRCODE=$(echo "$BODY" | jq -r '.errcode // "-1"')
+          if [ "$ERRCODE" != "0" ]; then
+            echo "::error::企业微信错误码 $ERRCODE，$BODY"
+            exit 1
+          fi
+
+          echo "推送成功"
