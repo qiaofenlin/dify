@@ -13,7 +13,10 @@ on:
     types: [created]
   release:
     types: [published, created, edited, deleted]
+  # CI 失败通知。GitHub 要求 workflow_run 必须显式引用 workflows 列表，
+  # 填 `*` 表示监听本仓库所有 workflow（含本文件自身，故已用concurrency 防止自循环）
   workflow_run:
+    workflows: ["*"]
     types: [completed]
   # push 触发频率很高，已限定为主分支；如不需要可整块注释掉
   push:
@@ -48,6 +51,7 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           WR_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          WR_NAME: ${{ github.event.workflow_run.name }}
         run: |
           set -euo pipefail
 
@@ -90,13 +94,19 @@ jobs:
               ACTION_LABEL="${ACTION:-}release"
               ;;
             workflow_run)
+              # 跳过本文件自身触发的运行，避免无限自循环
+              if [ "${WR_NAME:-}" = "通知企业微信" ]; then
+                echo "skip=true" >> "$GITHUB_OUTPUT"
+                echo "跳过本workflow 自身运行，避免自循环"
+                exit 0
+              fi
               if [ "${WR_CONCLUSION:-}" != "failure" ]; then
                 echo "conclusion=${WR_CONCLUSION:-unknown} 非失败，跳过通知"
                 echo "skip=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
               EMOJI="❌"
-              HEAD="CI 失败：${SAFE_TITLE}"
+              HEAD="CI 失败：${WR_NAME:-unknown} / ${BRANCH:-}"
               ACTION_LABEL="ci-failed"
               ;;
             push)
