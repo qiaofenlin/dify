@@ -4,6 +4,7 @@ name: 通知企业微信
 # 注意：本仓库 Issues 当前未启用（hasIssuesEnabled=false），
 # 因此 issues 触发器不会生效；如需启用请在 Settings → General → Features 打开 Issues。
 on:
+  workflow_dispatch:       # 手动触发，用于测试整条链路
   pull_request:
     types: [opened, closed, reopened, synchronize, review_requested, ready_for_review]
   pull_request_review:
@@ -53,53 +54,67 @@ jobs:
           # 去掉换行与多余空格，避免破坏 markdown 结构
           SAFE_TITLE=$(echo "$TITLE" | tr '\n\r' '  ' | sed 's/[[:space:]]\+/ /g' | cut -c1-120)
 
-          # 评论正文单独截断（企业微信正文上限 4096 字节）
-          SNIP=$(echo "$COMMENT_BODY" | tr '\n\r' '  ' | sed 's/[[:space:]]\+/ /g' | cut -c1-150)
+          # 未定义变量取空值，避免手动触发时出现空字段
+          ACTION="${ACTION:-}"
+          SNIP=$(echo "${COMMENT_BODY:-}" | tr '\n\r' '  ' | sed 's/[[:space:]]\+/ /g' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | cut -c1-150)
 
           case "$EVENT_NAME" in
+            workflow_dispatch)
+              EMOJI="✅"
+              HEAD="手动测试：webhook 推送链路正常"
+              ACTION_LABEL="手动触发"
+              ;;
             issues)
               EMOJI="📌"
               HEAD="Issue #${NUM} ${SAFE_TITLE}"
+              ACTION_LABEL="${ACTION:-}issue"
               ;;
             pull_request)
               EMOJI="🔀"
               HEAD="PR #${NUM} ${SAFE_TITLE}"
+              ACTION_LABEL="${ACTION:-}pr"
               ;;
             pull_request_review)
               EMOJI="⭐️"
-              HEAD="PR #${NUM} 评审：${STATE} — ${SAFE_TITLE}"
+              HEAD="PR #${NUM} 评审：${STATE:-待定} — ${SAFE_TITLE}"
+              ACTION_LABEL="review"
               ;;
             issue_comment)
               EMOJI="💬"
               HEAD="#${NUM} 新评论"
+              ACTION_LABEL="comment"
               ;;
             release)
               EMOJI="🚀"
               HEAD="Release ${SAFE_TITLE}"
+              ACTION_LABEL="${ACTION:-}release"
               ;;
             workflow_run)
-              if [ "$WR_CONCLUSION" != "failure" ]; then
-                echo "conclusion=$WR_CONCLUSION 非失败，跳过通知"
+              if [ "${WR_CONCLUSION:-}" != "failure" ]; then
+                echo "conclusion=${WR_CONCLUSION:-unknown} 非失败，跳过通知"
                 echo "skip=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
               EMOJI="❌"
               HEAD="CI 失败：${SAFE_TITLE}"
+              ACTION_LABEL="ci-failed"
               ;;
             push)
               EMOJI="📥"
-              HEAD="推送至 ${BRANCH}：${SAFE_TITLE}"
+              HEAD="推送至 ${BRANCH:-main}：${SAFE_TITLE}"
+              ACTION_LABEL="push"
               ;;
             *)
               EMOJI="🔔"
               HEAD="${SAFE_TITLE}"
+              ACTION_LABEL="${ACTION:-}event"
               ;;
           esac
 
           {
             echo "**${EMOJI} ${HEAD}**"
             echo "> 仓库：\`${REPO}\`"
-            echo "> 操作者：${ACTOR}　事件：\`${ACTION}\`"
+            echo "> 操作者：${ACTOR}　事件：\`${ACTION_LABEL}\`"
             if [ -n "${REF_NAME:-}" ]; then
               echo "> 来源分支：\`${REF_NAME}\`"
             fi
@@ -113,16 +128,15 @@ jobs:
             fi
           } > body.md
 
-          echo "content<<EOF_WECOM" >> "$GITHUB_OUTPUT"
-          cat body.md
-          echo "" >> "$GITHUB_OUTPUT"
-          echo "EOF_WECOM" >> "$GITHUB_OUTPUT"
+          # 用 base64 传递，避免多行内容在 GITHUB_OUTPUT 传递时被截断或解析异常
+          B64=$(base64 -w0 < body.md)
+          echo "content_b64=$B64" >> "$GITHUB_OUTPUT"
 
       - name: 推送到企业微信
         if: steps.msg.outputs.skip != 'true'
         env:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK_URL }}
-          CONTENT: ${{ steps.msg.outputs.content }}
+          CONTENT_B64: ${{ steps.msg.outputs.content_b64 }}
         run: |
           set -euo pipefail
 
@@ -132,6 +146,7 @@ jobs:
           fi
 
           # 企业微信 markdown 内容上限 4096 字节，留出余量后截断
+          CONTENT=$(printf '%s' "$CONTENT_B64" | base64 -d)
           MAX=3800
           if [ "${#CONTENT}" -gt "$MAX" ]; then
             CONTENT="${CONTENT:0:$MAX}..."
